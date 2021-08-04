@@ -17,13 +17,16 @@ import (
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog"
 	"k8s.io/klog/klogr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 )
 
 // TODO: can we get away without running this on workload clusters? Template in supervisor address?
@@ -94,13 +97,32 @@ func main() {
 }
 
 func addControllersToManager(mgr ctrl.Manager, config *config) error {
+	enqueueRequestsFromServiceRelatedObjects := handler.EnqueueRequestsFromMapFunc(func(o client.Object) []ctrl.Request {
+		return []ctrl.Request{{NamespacedName: types.NamespacedName{Namespace: config.names.supervisorNamespace, Name: config.names.service}}}
+	})
+
+	// It would be great if we could set OwnerReferences on these child objects, but that is hard to
+	// do since we want the kapp-controller to deploy them.
 	_, err := ctrl.
 		NewControllerManagedBy(mgr).
 		For(&corev1.Service{}, builder.WithPredicates(newNamespaceNamePredicate(config.names.supervisorNamespace, config.names.service))).
-		Owns(&certmanagerv1beta1.Certificate{}, builder.WithPredicates(newNamespaceNamePredicate(config.names.conciergeNamespace, config.names.federationDomainCert))).
-		Owns(&supervisorconfigv1alpha1.FederationDomain{}, builder.WithPredicates(newNamespaceNamePredicate(config.names.supervisorNamespace, config.names.federationDomain))).
-		Owns(&conciergeauthv1alpha1.JWTAuthenticator{}, builder.WithPredicates(newNamespaceNamePredicate(config.names.conciergeNamespace, config.names.jwtAuthenticator))).
+		Watches(
+			&source.Kind{Type: &certmanagerv1beta1.Certificate{}},
+			enqueueRequestsFromServiceRelatedObjects,
+			builder.WithPredicates(newNamespaceNamePredicate(config.names.supervisorNamespace, config.names.federationDomainCert)),
+		).
+		Watches(
+			&source.Kind{Type: &supervisorconfigv1alpha1.FederationDomain{}},
+			enqueueRequestsFromServiceRelatedObjects,
+			builder.WithPredicates(newNamespaceNamePredicate(config.names.supervisorNamespace, config.names.federationDomain)),
+		).
+		Watches(
+			&source.Kind{Type: &conciergeauthv1alpha1.JWTAuthenticator{}},
+			enqueueRequestsFromServiceRelatedObjects,
+			builder.WithPredicates(newNamespaceNamePredicate(config.names.conciergeNamespace, config.names.jwtAuthenticator)),
+		).
 		Build(newController(config, mgr.GetClient()))
+
 	return err
 }
 
@@ -138,10 +160,10 @@ func (c *controller) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 
 	// Apply the supervisor serving cert.
-	cert := configToCert(c.config)
-	appliedCert, err := c.apply(ctx, cert, supervisorHostToCertFunc(supervisorHost))
+	supervisorServingCert := makeSupervisorServingCert(c.config, &s)
+	appliedCert, err := c.apply(ctx, supervisorServingCert, supervisorHostToCertFunc(supervisorHost))
 	if err != nil {
-		c.config.log.Error(err, "cannot apply serving cert", "serviceNamespacedName", req.NamespacedName, "certNamespace", cert.GetNamespace(), "certName", cert.GetName())
+		c.config.log.Error(err, "cannot apply serving cert", "serviceNamespacedName", req.NamespacedName, "certNamespace", supervisorServingCert.GetNamespace(), "certName", supervisorServingCert.GetName())
 		return ctrl.Result{}, err
 	}
 	c.config.log.Info("applied supervisor serving cert", "serviceNamespacedName", req.NamespacedName, "certNamespace", appliedCert.GetNamespace(), "certName", appliedCert.GetName())
@@ -155,7 +177,7 @@ func (c *controller) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 
 	// Apply the supervisor federation domain.
-	federationDomain := configToFederationDomain(c.config)
+	federationDomain := makeFederationDomain(c.config, &s)
 	appliedFederationDomain, err := c.apply(ctx, federationDomain, supervisorAddressAndCertToFederationDomainFunc(supervisorHost, supervisorPort, appliedCert.(*certmanagerv1beta1.Certificate)))
 	if err != nil {
 		c.config.log.Error(err, "cannot apply supervisor federation domain", "serviceNamespacedName", req.NamespacedName, "federationDomainNamespace", federationDomain.Namespace, "federationDomainName", federationDomain.Name)
@@ -164,7 +186,7 @@ func (c *controller) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	c.config.log.Info("applied supervisor federation domain", "serviceNamespacedName", req.NamespacedName, "namespace", appliedFederationDomain.GetNamespace(), "name", appliedFederationDomain.GetName())
 
 	// Apply the concierge jwt authenticator.
-	jwtAuthenticator := configToJWTAuthenticator(c.config)
+	jwtAuthenticator := makeJWTAuthenticator(c.config, &s)
 	appliedJWTAuthenticator, err := c.apply(ctx, jwtAuthenticator, federationDomainAndSupervisorServingCertCADataToJWTAuthenticatorFunc(appliedFederationDomain.(*supervisorconfigv1alpha1.FederationDomain), supervisorServingCertCAData))
 	if err != nil {
 		c.config.log.Error(err, "cannot create concierge jwt authenticator", "serviceNamespacedName", req.NamespacedName, "jwtAuthenticatorNamespace", jwtAuthenticator.Namespace, "jwtAuthenticatorName", jwtAuthenticator.Name)
@@ -308,9 +330,12 @@ func (c *controller) apply(ctx context.Context, obj client.Object, applyFunc fun
 	return obj, nil
 }
 
-func configToCert(config *config) *certmanagerv1beta1.Certificate {
+func makeSupervisorServingCert(config *config, s *corev1.Service) *certmanagerv1beta1.Certificate {
 	return &certmanagerv1beta1.Certificate{
-		ObjectMeta: metav1.ObjectMeta{Namespace: config.names.supervisorNamespace, Name: config.names.federationDomainCert},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: config.names.supervisorNamespace,
+			Name:      config.names.federationDomainCert,
+		},
 	}
 }
 
@@ -326,9 +351,12 @@ func supervisorHostToCertFunc(supervisorHost string) func(obj client.Object) {
 	}
 }
 
-func configToFederationDomain(config *config) *supervisorconfigv1alpha1.FederationDomain {
+func makeFederationDomain(config *config, s *corev1.Service) *supervisorconfigv1alpha1.FederationDomain {
 	return &supervisorconfigv1alpha1.FederationDomain{
-		ObjectMeta: metav1.ObjectMeta{Namespace: config.names.supervisorNamespace, Name: config.names.federationDomain},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: config.names.supervisorNamespace,
+			Name:      config.names.federationDomain,
+		},
 	}
 }
 
@@ -340,9 +368,12 @@ func supervisorAddressAndCertToFederationDomainFunc(supervisorHost, supervisorPo
 	}
 }
 
-func configToJWTAuthenticator(config *config) *conciergeauthv1alpha1.JWTAuthenticator {
+func makeJWTAuthenticator(config *config, s *corev1.Service) *conciergeauthv1alpha1.JWTAuthenticator {
 	return &conciergeauthv1alpha1.JWTAuthenticator{
-		ObjectMeta: metav1.ObjectMeta{Namespace: config.names.conciergeNamespace, Name: config.names.jwtAuthenticator},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: config.names.conciergeNamespace,
+			Name:      config.names.jwtAuthenticator,
+		},
 	}
 }
 
